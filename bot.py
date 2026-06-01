@@ -1,132 +1,144 @@
-
 import logging
-import sqlite3
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import os
+import re
+import asyncio
+import threading
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CopyTextButton
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# Enable logging
+# Set up logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# Database setup
-def init_db():
-    conn = sqlite3.connect('calculator_history.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            expression TEXT,
-            result TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Configuration
+TOKEN = os.getenv("BOT_TOKEN", "8223310359:AAH6yKOS_gsP0sTC3rjG9E871jf0zSGNvPY") # Using the user provided token
 
-def add_history(user_id, expression, result):
-    conn = sqlite3.connect('calculator_history.db')
-    c = conn.cursor()
-    c.execute("INSERT INTO history (user_id, expression, result) VALUES (?, ?, ?)", (user_id, expression, result))
-    conn.commit()
-    conn.close()
+def format_number(number):
+    """Formats a number with thousand separators."""
+    if isinstance(number, (int, float)):
+        if isinstance(number, float) and number.is_integer():
+            number = int(number)
+        return "{:,}".format(number)
+    return str(number)
 
-def get_history(user_id, limit=5):
-    conn = sqlite3.connect('calculator_history.db')
-    c = conn.cursor()
-    c.execute("SELECT expression, result FROM history WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?", (user_id, limit))
-    history = c.fetchall()
-    conn.close()
-    return history
-
-# Calculator logic
-def evaluate_expression(expression):
+def safe_eval(expr):
+    """Safely evaluate a mathematical expression."""
+    # Allow only specific characters
+    if not re.match(r'^[\d\+\-\*\/\(\)\.\^ ]+$', expr):
+        return None
     try:
-        # Basic validation to prevent arbitrary code execution
-        if not all(c.isdigit() or c in '+-*/(). ' for c in expression):
-            return "Invalid characters in expression."
-        result = str(eval(expression))
+        # Replace ^ with ** for Python power operator
+        clean_expr = expr.replace('^', '**')
+        # Use a limited scope for eval
+        result = eval(clean_expr, {"__builtins__": None}, {})
         return result
-    except Exception as e:
-        return f"Error: {e}"
+    except Exception:
+        return None
 
-# Command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    await update.message.reply_html(
-        f"Hi {user.mention_html()}! I am a calculator bot. Send me an arithmetic expression (e.g., `2+2` or `(5*3)-1`).\n\n" \
-        "You can also use `/history` to see your last calculations."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_text = (
+        "🎉 Welcome from Mixx's Calculator Bot!\n\n"
+        "✅ You can now use all calculator commands in DM.\n"
+        "📌 Supported operations:\n"
+        "➕ Addition (+)\n"
+        "➖ Subtraction (-)\n"
+        "✖️ Multiplication (*)\n"
+        "➗ Division (/)\n"
+        "🔢 Parentheses ( )\n"
+        "⬆️ Exponentiation (^)\n\n"
+        "💡 Example: 2+3*5 or (10+2)^2"
     )
+    if update.message:
+        await update.message.reply_text(welcome_text)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Send me an arithmetic expression (e.g., `2+2` or `(5*3)-1`).\n\n" \
-        "Commands:\n" \
-        "/start - Start the bot\n" \
-        "/help - Get help message\n" \
-        "/history - View your calculation history"
-    )
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+        
+    expr = update.message.text.strip()
+    
+    # Check if it looks like a math expression (contains at least one digit)
+    if not any(char.isdigit() for char in expr):
+        return
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    history = get_history(user_id)
-    if history:
-        response = "Your last calculations:\n"
-        for expr, res in history:
-            response += f"`{expr}` = `{res}`\n"
-    else:
-        response = "No history found. Start calculating!"
-    await update.message.reply_text(response, parse_mode='Markdown')
+    result = safe_eval(expr)
+    
+    if result is not None:
+        formatted_result = format_number(result)
+        
+        # Format the display text (removed fire emoji as requested)
+        display_text = f"<code>{expr} = {formatted_result}</code>"
+        
+        # Create keyboard with copy and delete buttons
+        # Using standard emojis for better compatibility and stability
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    text="Copy", 
+                    callback_data=f"copy_{result}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Delete", 
+                    callback_data="delete"
+                )
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        try:
+            await update.message.reply_text(display_text, reply_markup=reply_markup, parse_mode='HTML')
+        except Exception as e:
+            logging.error(f"Error sending message: {e}")
 
-async def calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    expression = update.message.text
-    user_id = update.effective_user.id
-    result = evaluate_expression(expression)
-
-    if not result.startswith("Error") and not result.startswith("Invalid"):
-        add_history(user_id, expression, result)
-
-    keyboard = [
-        [InlineKeyboardButton("History", callback_data="history")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(f"Result: `{result}`", reply_markup=reply_markup, parse_mode='Markdown')
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    if query.data == "delete":
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logging.error(f"Error deleting message: {e}")
+    elif query.data.startswith("copy_"):
+        result_to_copy = query.data.replace("copy_", "")
+        await query.answer(text=f"Copied: {result_to_copy}", show_alert=True)
 
-    if query.data == "history":
-        user_id = query.from_user.id
-        history = get_history(user_id)
-        if history:
-            response = "Your last calculations:\n"
-            for expr, res in history:
-                response += f"`{expr}` = `{res}`\n"
-        else:
-            response = "No history found. Start calculating!"
-        await query.edit_message_text(text=response, parse_mode='Markdown')
+# Flask for keep-alive
+app = Flask('')
 
-def main() -> None:
-    # Replace with your actual bot token
-    TOKEN = "8223310359:AAH6yKOS_gsP0sTC3rjG9E871jf0zSGNvPY"
-    application = Application.builder().token(TOKEN).build()
+@app.route('/')
+def home():
+    return "I'm alive!"
 
-    # Initialize database
-    init_db()
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
 
-    # Register handlers
+async def main():
+    # Start Flask in a separate thread
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    application = ApplicationBuilder().token(TOKEN).build()
+    
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("history", history_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, calculate))
-    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    print("Bot is starting...")
+    
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)
 
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
